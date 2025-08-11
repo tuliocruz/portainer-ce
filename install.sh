@@ -1,34 +1,74 @@
 #!/usr/bin/env bash
-# Debian 12 (Bookworm) - Installer interativo
-# Swarm + Traefik (TLS/LE, dashboard com BasicAuth) + Portainer CE/Agent (versões fixas)
-# Perguntas: e-mail, domínios (traefik/portainer/edge) e senha do dashboard Traefik
-set -Eeuo pipefail
+# Debian 12 (Bookworm)
+# Swarm + Traefik (LE + BasicAuth) + Portainer CE/Agent (versões fixas)
+# Perguntas: email (LE), domínios (Traefik/Portainer/Edge) e senha do Traefik
+# Execução: sudo ./install.sh
 
-# ===================== Cores/UX =====================
+set -Eeo pipefail   # sem -u para não quebrar com parâmetros faltantes
+trap 'echo -e "\n[ERR] Falhou na linha $LINENO"; exit 1' ERR
+
+# ===================== Aparência =====================
 GREEN='\e[32m'; YELLOW='\e[33m'; RED='\e[31m'; BLUE='\e[34m'; NC='\e[0m'
-spinner(){ local pid=$1 delay=0.1 spin='|/-\'; while kill -0 "$pid" 2>/dev/null; do for i in $(seq 0 3); do printf " [%c] " "${spin:$i:1}"; sleep $delay; printf "\b\b\b\b\b"; done; done; printf "     \b\b\b\b\b"; }
-logo(){ clear; echo -e "${GREEN}
+
+spinner() {
+  local pid="$1" delay=0.1 sp='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do
+    for i in 0 1 2 3; do
+      printf " [%c] " "${sp:$i:1}"
+      sleep "$delay"
+      printf "\b\b\b\b\b"
+    done
+  done
+  printf "     \b\b\b\b\b"
+}
+
+logo() {
+  clear
+  echo -e "${GREEN}
   _____        _____ _  __  _________     _______  ______ ____   ____ _______ 
  |  __ \ /\   / ____| |/ / |__   __\ \   / /  __ \|  ____|  _ \ / __ \__   __|
  | |__) /  \ | |    | ' /     | |   \ \_/ /| |__) | |__  | |_) | |  | | | |   
  |  ___/ /\ \| |    |  <      | |    \   / |  ___/|  __| |  _ <| |  | | | |   
  | |  / ____ \ |____| . \     | |     | |  | |    | |____| |_) | |__| | | |   
  |_| /_/    \_\_____|_|\_\    |_|     |_|  |_|    |______|____/ \____/  |_|   
-${NC}"; }
-step(){ local c=$1 t=5 p=$((c*100/t)) f=$((p/2)); echo -ne "${GREEN}Passo ${YELLOW}$c/$t ${GREEN}["; for ((i=0;i<50;i++)); do [[ $i -lt $f ]] && echo -n "=" || echo -n " "; done; echo -e "] ${p}%${NC}"; }
+${NC}"
+}
+
+step() {
+  # seguro mesmo sem parâmetro
+  local c="${1:-1}" total=5
+  local p=$((c*100/total))
+  local f=$((p/2))
+  echo -ne "${GREEN}Passo ${YELLOW}${c}/${total} ${GREEN}["
+  for ((i=0;i<50;i++)); do
+    if (( i < f )); then echo -n "="; else echo -n " "; fi
+  done
+  echo -e "] ${p}%${NC}"
+}
 
 # ===================== Versões =====================
+TRAEFIK_VERSION="${TRAEFIK_VERSION:-v3.5.0}"
 PORTAINER_VERSION="${PORTAINER_VERSION:-2.32.0}"
 AGENT_VERSION="${AGENT_VERSION:-2.32.0}"
-TRAEFIK_VERSION="${TRAEFIK_VERSION:-v3.5.0}"
 
 # ===================== Helpers =====================
-has(){ command -v "$1" >/dev/null 2>&1; }
-as_root(){ if [[ $EUID -ne 0 ]]; then sudo bash -c "$*"; else bash -c "$*"; fi; }
-ipv4(){ local ip; ip=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i !~ /^127\./ && $i ~ /^[0-9.]+$/) {print $i; exit}}'); [[ -n "${ip:-}" ]] && { echo "$ip"; return; }; ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'); echo "${ip:-127.0.0.1}"; }
-dhcp_in_use(){ pgrep -x dhclient >/dev/null 2>&1 && return 0; grep -RqsE 'iface\s+.+\s+inet\s+dhcp' /etc/network/interfaces* 2>/dev/null && return 0; grep -Rqs 'DHCP=yes' /etc/systemd/network 2>/dev/null && return 0; return 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+as_root() { if [[ $EUID -ne 0 ]]; then sudo bash -c "$*"; else bash -c "$*"; fi; }
+ipv4() {
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i !~ /^127\./ && $i ~ /^[0-9.]+$/) {print $i; exit}}')
+  [[ -n "$ip" ]] && { echo "$ip"; return; }
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  echo "${ip:-127.0.0.1}"
+}
+dhcp_in_use() {
+  pgrep -x dhclient >/dev/null 2>&1 && return 0
+  grep -RqsE 'iface\s+.+\s+inet\s+dhcp' /etc/network/interfaces* 2>/dev/null && return 0
+  grep -Rqs 'DHCP=yes' /etc/systemd/network 2>/dev/null && return 0
+  return 1
+}
 
-# ===================== 0) UI & Inputs =====================
+# ===================== 0) Inputs =====================
 logo
 echo -e "${GREEN}=============================================================================="
 echo -e "=                 ${YELLOW}Preencha as informações solicitadas abaixo${GREEN}                 ="
@@ -42,30 +82,28 @@ step 5; read -rp "🌐 Domínio do Edge (ex: edge.seudominio.com): " EDGE_DOMAIN
 echo
 
 clear
-echo -e "${BLUE}📋 Resumo das Informações${NC}"
-echo -e "${GREEN}================================${NC}"
-echo -e "📧 E-mail LE: ${YELLOW}${EMAIL}${NC}"
-echo -e "🌐 Traefik: ${YELLOW}${TRAEFIK_DOMAIN}${NC}"
-echo -e "🔑 Traefik (senha): ${YELLOW}********${NC}"
-echo -e "🌐 Portainer: ${YELLOW}${PORTAINER_DOMAIN}${NC}"
-echo -e "🌐 Edge: ${YELLOW}${EDGE_DOMAIN}${NC}"
-echo -e "${GREEN}================================${NC}\n"
+echo -e "${BLUE}📋 Resumo das Informações${NC}
+${GREEN}================================${NC}
+📧 E-mail LE: ${YELLOW}${EMAIL}${NC}
+🌐 Traefik:  ${YELLOW}${TRAEFIK_DOMAIN}${NC}
+🔑 Traefik:  ${YELLOW}********${NC}
+🌐 Portainer: ${YELLOW}${PORTAINER_DOMAIN}${NC}
+🌐 Edge:      ${YELLOW}${EDGE_DOMAIN}${NC}
+${GREEN}================================${NC}\n"
 read -rp "As informações estão corretas? (y/n): " OK
 [[ "${OK,,}" != "y" ]] && { echo -e "${RED}❌ Instalação cancelada.${NC}"; exit 0; }
 
 # ===================== 1) Pré-checagens =====================
 echo -e "${BLUE}Verificando requisitos do sistema...${NC}"
-# Espaço
 FREE_GB=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
-[[ $FREE_GB -lt 5 ]] && { echo -e "${RED}❌ Espaço insuficiente (<5GB).${NC}"; exit 1; }
-# Memória
+[[ ${FREE_GB:-0} -lt 5 ]] && { echo -e "${RED}❌ Espaço insuficiente (<5GB).${NC}"; exit 1; }
 TOTAL_RAM_GB=$(free -g | awk 'NR==2{print $2}')
-[[ $TOTAL_RAM_GB -lt 1 ]] && { echo -e "${RED}❌ RAM insuficiente (<1GB).${NC}"; exit 1; }
+[[ ${TOTAL_RAM_GB:-0} -lt 1 ]] && { echo -e "${RED}❌ RAM insuficiente (<1GB).${NC}"; exit 1; }
 echo -e "${GREEN}✅ Requisitos OK${NC}"
 
-# ===================== 2) Limpeza leve (opcional, segura) =====================
-echo -e "${YELLOW}Deseja limpar pacotes não essenciais antes? (recomendado) [Y/n]${NC}"
-read -r DO_CLEAN; DO_CLEAN=${DO_CLEAN:-Y}
+# ===================== 2) Limpeza leve (opcional) =====================
+read -rp "Deseja limpar pacotes não essenciais antes? (recomendado) [Y/n]: " DO_CLEAN
+DO_CLEAN=${DO_CLEAN:-Y}
 if [[ "${DO_CLEAN,,}" == "y" ]]; then
   echo -e "${YELLOW}🧹 Limpando pacotes não essenciais...${NC}"
   PKGS="apt-listchanges console-setup console-setup-linux debconf-i18n dictionaries-common iamerican ibritish keyboard-configuration \
@@ -105,22 +143,17 @@ else
   echo -e "${GREEN}✅ Swarm já ativo${NC}"
 fi
 
-# ===================== 5) Preparos (hash da senha, rede/volumes) =====================
-# Hash BasicAuth (formato apr1 para Traefik)
+# ===================== 5) Preparos =====================
+# Hash BasicAuth (apr1) para Traefik
 if ! has openssl; then as_root "apt-get update -y && apt-get install -y openssl" >/dev/null 2>&1; fi
 TRAEFIK_USER="admin"
 TRAEFIK_HASH=$(openssl passwd -apr1 "${TRAEFIK_PASS}")
-# Rede overlay para Traefik/Portainer
+
 STACK_NAME="infra"
 STACK_DIR="/opt/${STACK_NAME}"
 as_root "mkdir -p '${STACK_DIR}'"
 
-# ===================== 6) Stack YAML (Traefik + Portainer CE/Agent) =====================
-# Observações:
-# - Traefik com swarmMode, exposedByDefault=false, dashboard com BasicAuth e Let's Encrypt (HTTP-01)
-# - serversTransport.insecureSkipVerify=true para falar com Portainer (9443, self-signed)
-# - Portainer CE via Agent (global). UI roteada por Traefik nos domínios fornecidos.
-# - Sem publicar 9443/8000 externamente; tudo passa pelo Traefik.
+# ===================== 6) Stack (Traefik + Portainer) =====================
 cat > "/tmp/${STACK_NAME}.yml" <<YAML
 version: "3.8"
 
@@ -175,7 +208,6 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        # dashboard protegido por BasicAuth
         - "traefik.http.routers.traefik.rule=Host(\`${TRAEFIK_DOMAIN}\`)"
         - "traefik.http.routers.traefik.entrypoints=websecure"
         - "traefik.http.routers.traefik.tls.certresolver=leresolver"
@@ -197,7 +229,6 @@ services:
       placement:
         constraints:
           - node.platform.os == linux
-        # Em clusters multi-nó, o Agent rodará em todos
 
   portainer:
     image: portainer/portainer-ce:${PORTAINER_VERSION}
@@ -217,20 +248,20 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        # Rota da UI Portainer (backend HTTPS 9443; skipVerify global)
+        # UI do Portainer (backend 9443 HTTPS; skipVerify já global no serversTransport)
         - "traefik.http.routers.portainer.rule=Host(\`${PORTAINER_DOMAIN}\`)"
         - "traefik.http.routers.portainer.entrypoints=websecure"
         - "traefik.http.routers.portainer.tls.certresolver=leresolver"
-        - "traefik.http.services.portainer.loadbalancer.server.port=9443"
         - "traefik.http.services.portainer.loadbalancer.server.scheme=https"
-        # Rota Edge (túnel) - mesma service, porta 8000
+        - "traefik.http.services.portainer.loadbalancer.server.port=9443"
+        # Edge (túnel) - porta 8000
         - "traefik.http.routers.edge.rule=Host(\`${EDGE_DOMAIN}\`)"
         - "traefik.http.routers.edge.entrypoints=websecure"
         - "traefik.http.routers.edge.tls.certresolver=leresolver"
         - "traefik.http.services.edge.loadbalancer.server.port=8000"
 YAML
 
-# garantir permissão para acme.json dentro do volume (Traefik cria se não existir)
+# Volume para LE (Traefik cria acme.json)
 as_root "docker volume create traefik_letsencrypt >/dev/null 2>&1 || true"
 
 # ===================== 7) Deploy =====================
@@ -249,7 +280,6 @@ echo -e "${YELLOW}Se usar firewall, abra as portas:${NC}
 "
 
 # ===================== 10) Sumário =====================
-HOST_IP=$(ipv4)
 echo -e "${GREEN}================================${NC}"
 echo -e "✅  Deploy concluído."
 echo -e "🔐 Traefik Dashboard: https://${TRAEFIK_DOMAIN}"
