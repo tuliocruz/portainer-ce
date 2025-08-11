@@ -1,157 +1,255 @@
-#!/bin/bash
-#───────────────────────────────────────────────────────────────────────────────
-#  install-swarm.sh – Traefik + Portainer em Docker Swarm (Debian/Ubuntu)
-#───────────────────────────────────────────────────────────────────────────────
-set -e
+#!/usr/bin/env bash
+# install.sh - Debian 12: Docker Engine + Swarm + Portainer CE (versões fixas) via stack
+# Execução:
+#   sudo ./install.sh
+# Reexecutável com segurança (idempotente).
 
-# ── Cores
-GREEN='\e[32m'; YELLOW='\e[33m'; RED='\e[31m'; BLUE='\e[34m'; NC='\e[0m'
+set -euo pipefail
 
-# ── Spinner
-spinner(){ local pid=$1; local delay=0.1; local spin='|/-\'; while kill -0 $pid 2>/dev/null; do
-  printf " [%c]  " "$spin"; spin=${spin#?}${spin%??}; sleep $delay; printf "\b\b\b\b\b\b";
-done; printf "    \b\b\b\b"; }
+############################################
+#               CONFIGURÁVEIS             #
+############################################
+PORTAINER_VERSION="${PORTAINER_VERSION:-2.32.0}"  # Versão fixa do Portainer CE
+AGENT_VERSION="${AGENT_VERSION:-2.32.0}"          # Versão fixa do Portainer Agent
+EXPOSE_TUNNEL="${EXPOSE_TUNNEL:-true}"            # true = expõe porta 8000 (túnel/Edge)
+ADD_USER_TO_DOCKER="${ADD_USER_TO_DOCKER:-false}" # true = adiciona usuário atual ao grupo docker
+STACK_NAME="${STACK_NAME:-portainer}"
+STACK_DIR="${STACK_DIR:-/opt/portainer}"
+COMPOSE_FILE="${COMPOSE_FILE:-${STACK_DIR}/portainer-agent-stack.yml}"
+DEBIAN_CODENAME="bookworm"
 
-# ── Requisitos mínimos (2 GB RAM / 10 GB disco)
-check_system(){ echo -e "${BLUE}Verificando requisitos...${NC}";
-  [ "$(df -BG / | awk 'NR==2{print $4}'|tr -d 'G')" -lt 10 ] && \
-    { echo -e "${RED}❌ Espaço em disco insuficiente (10 GB+)${NC}"; exit 1; }
-  [ "$(free -g | awk 'NR==2{print $2}')" -lt 2 ] && \
-    { echo -e "${RED}❌ RAM insuficiente (2 GB+)${NC}"; exit 1; }
-  echo -e "${GREEN}✅ Requisitos ok${NC}"; }
+############################################
+#             FUNÇÕES AUXILIARES          #
+############################################
+log()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+err()  { echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
 
-# ── Perguntas ao usuário
-read_inputs(){
-  echo -e "${YELLOW}📧 E-mail Let's Encrypt:${NC}"; read -r EMAIL
-  echo -e "${YELLOW}🌐 Domínio do Traefik (ex.: traefik.exemplo.com):${NC}"; read -r TR_DOMAIN
-  echo -e "${YELLOW}🔑 Senha básica do Traefik (formato user:$(openssl passwd -apr1)): ${NC}"; read -r TR_AUTH
-  echo -e "${YELLOW}🌐 Domínio do Portainer (ex.: portainer.exemplo.com):${NC}"; read -r PT_DOMAIN
-  echo -e "${YELLOW}🌐 Domínio do Edge (opcional, ex.: edge.exemplo.com):${NC}"; read -r EDGE_DOMAIN
-  echo ""; echo -e "${GREEN}Confirme [y/N]:${NC}"; read -r CONFIRM
-  [[ "${CONFIRM,,}" != "y" ]] && { echo -e "${RED}Cancelado.${NC}"; exit 0; } }
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Comando obrigatório não encontrado: $1"; exit 1; }
+}
 
-# ── Instala Docker
-install_docker(){
-  echo -e "${BLUE}Instalando Docker...${NC}";
-  (apt update -y && apt upgrade -y && \
-   apt install -y curl ca-certificates gnupg lsb-release >/dev/null && \
-   curl -fsSL https://get.docker.com | sh) & spinner $!; }
-
-# ── Inicializa Swarm (se ainda não)
-init_swarm(){
-  if docker info --format '{{.Swarm.LocalNodeState}}' | grep -q inactive; then
-     local IP=$(hostname -I | awk '{print $1}')
-     docker swarm init --advertise-addr "$IP"
-     echo -e "${GREEN}✅ Swarm iniciado (manager: $IP)${NC}"
-  else
-     echo -e "${GREEN}🌀 Swarm já ativo${NC}"
+require_root_or_sudo() {
+  if [[ $EUID -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      err "Execute como root ou instale 'sudo' (su -c 'apt-get update && apt-get install -y sudo')."
+      exit 1
+    fi
   fi
 }
 
-# ── Cria rede overlay & volumes persistentes
-prepare_storage(){
-  docker network ls | grep -q proxy_net || \
-    docker network create --driver overlay --attachable proxy_net
-  docker volume ls   | grep -q portainer_data || \
-    docker volume create portainer_data
-  mkdir -p /opt/traefik && touch /opt/traefik/acme.json && chmod 600 /opt/traefik/acme.json
+as_root() {
+  if [[ $EUID -ne 0 ]]; then sudo bash -c "$*"; else bash -c "$*"; fi
 }
 
-# ── Gera stack.yml
-generate_stack(){
-cat >/root/stack.yml <<EOF
-version: "3.9"
-networks:
-  proxy_net:
-    external: true
+first_ipv4() {
+  # pega o primeiro IPv4 não-loopback
+  ip=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i !~ /^127\./ && $i ~ /^[0-9.]+$/) {print $i; exit}}')
+  if [[ -z "${ip:-}" ]]; then
+    # fallback: ip route
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  fi
+  echo "${ip:-127.0.0.1}"
+}
+
+ensure_dir() {
+  [[ -d "$1" ]] || as_root "mkdir -p '$1'"
+}
+
+apt_install() {
+  as_root "apt-get update -y"
+  as_root "DEBIAN_FRONTEND=noninteractive apt-get install -y $*"
+}
+
+############################################
+#        1) INSTALAR DOCKER ENGINE        #
+############################################
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker já está instalado. Pulando instalação do Engine."
+    return
+  fi
+
+  log "Instalando dependências..."
+  apt_install ca-certificates curl gnupg lsb-release
+
+  log "Adicionando chave GPG do Docker e repositório oficial..."
+  as_root "install -m 0755 -d /etc/apt/keyrings"
+  curl -fsSL https://download.docker.com/linux/debian/gpg | as_root "gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
+  as_root "chmod a+r /etc/apt/keyrings/docker.gpg"
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${DEBIAN_CODENAME} stable" \
+    | as_root "tee /etc/apt/sources.list.d/docker.list >/dev/null"
+
+  log "Instalando pacotes do Docker Engine..."
+  apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  log "Habilitando e iniciando serviço docker..."
+  as_root "systemctl enable --now docker"
+
+  if [[ "${ADD_USER_TO_DOCKER}" == "true" ]]; then
+    current_user="${SUDO_USER:-$USER}"
+    if id -nG "$current_user" 2>/dev/null | grep -qw docker; then
+      log "Usuário '$current_user' já está no grupo docker."
+    else
+      log "Adicionando '$current_user' ao grupo docker (efetivo após novo login)."
+      as_root "usermod -aG docker '$current_user' || true"
+    fi
+  fi
+
+  log "Docker Engine instalado com sucesso."
+}
+
+############################################
+#        2) INICIALIZAR DOCKER SWARM      #
+############################################
+init_swarm() {
+  local state
+  state=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "inactive")
+  if [[ "$state" == "active" ]]; then
+    log "Docker Swarm já está ativo."
+    return
+  fi
+
+  local ip
+  ip="$(first_ipv4)"
+  if [[ "$ip" == "127.0.0.1" ]]; then
+    warn "Não foi possível detectar um IPv4 não-loopback; usando 127.0.0.1."
+  fi
+
+  log "Inicializando Docker Swarm (advertise-addr: $ip)..."
+  as_root "docker swarm init --advertise-addr '${ip}'"
+  log "Swarm inicializado."
+}
+
+############################################
+#   3) ESCREVER COMPOSE E DEPLOY STACK    #
+############################################
+write_compose() {
+  ensure_dir "$STACK_DIR"
+
+  log "Gerando arquivo de stack: ${COMPOSE_FILE}"
+  cat > "${COMPOSE_FILE}.tmp" <<YAML
+version: "3.8"
 
 services:
-  traefik:
-    image: traefik:latest
-    command:
-      - "--providers.docker.swarmMode=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      - "--api.dashboard=true"
-      - "--log.level=ERROR"
-      - "--certificatesresolvers.leresolver.acme.httpchallenge=true"
-      - "--certificatesresolvers.leresolver.acme.httpchallenge.entrypoint=web"
-      - "--certificatesresolvers.leresolver.acme.email=${EMAIL}"
-      - "--certificatesresolvers.leresolver.acme.storage=/data/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "/opt/traefik:/data"
-    networks:
-      - proxy_net
-    deploy:
-      placement:
-        constraints: [node.role == manager]
-      labels:
-        - "traefik.http.routers.http-catchall.rule=hostregexp(\`{host:.+}\`)"
-        - "traefik.http.routers.http-catchall.entrypoints=web"
-        - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
-        - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
-        - "traefik.http.routers.traefik-dashboard.rule=Host(\`${TR_DOMAIN}\`)"
-        - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
-        - "traefik.http.routers.traefik-dashboard.service=api@internal"
-        - "traefik.http.routers.traefik-dashboard.tls.certresolver=leresolver"
-        - "traefik.http.routers.traefik-dashboard.middlewares=traefik-auth"
-        - "traefik.http.middlewares.traefik-auth.basicauth.users=${TR_AUTH}"
-
   portainer:
-    image: portainer/portainer-ce:latest
-    command: -H unix:///var/run/docker.sock
+    image: portainer/portainer-ce:${PORTAINER_VERSION}
+    ports:
+      - "9443:9443"
+YAML
+
+  if [[ "${EXPOSE_TUNNEL}" == "true" ]]; then
+    cat >> "${COMPOSE_FILE}.tmp" <<'YAML'
+      - "8000:8000"
+YAML
+  fi
+
+  cat >> "${COMPOSE_FILE}.tmp" <<'YAML'
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
-    networks:
-      - proxy_net
+      - /var/run/docker.sock:/var/run/docker.sock
     deploy:
+      mode: replicated
       replicas: 1
       placement:
-        constraints: [node.role == manager]
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.frontend.rule=Host(\`${PT_DOMAIN}\`)"
-        - "traefik.http.routers.frontend.entrypoints=websecure"
-        - "traefik.http.routers.frontend.service=frontend"
-        - "traefik.http.routers.frontend.tls.certresolver=leresolver"
-        - "traefik.http.services.frontend.loadbalancer.server.port=9000"
-        - "traefik.http.routers.edge.rule=Host(\`${EDGE_DOMAIN}\`)"
-        - "traefik.http.routers.edge.entrypoints=websecure"
-        - "traefik.http.routers.edge.service=edge"
-        - "traefik.http.routers.edge.tls.certresolver=leresolver"
-        - "traefik.http.services.edge.loadbalancer.server.port=8000"
+        constraints:
+          - node.role == manager
+    command: >
+      -H tcp://tasks.agent:9001
+      --tlsskipverify
+    networks:
+      - portainer_agent_network
+
+  agent:
+    image: portainer/agent:__AGENT_VERSION__
+    environment:
+      AGENT_CLUSTER_ADDR: tasks.agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - portainer_agent_network
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.platform.os == linux
+
+networks:
+  portainer_agent_network:
+    driver: overlay
 
 volumes:
   portainer_data:
-    external: true
+    driver: local
+YAML
+
+  # substitui placeholder da versão do agente
+  sed -i "s/__AGENT_VERSION__/${AGENT_VERSION}/g" "${COMPOSE_FILE}.tmp"
+  as_root "mv -f '${COMPOSE_FILE}.tmp' '${COMPOSE_FILE}'"
+}
+
+deploy_stack() {
+  log "Fazendo deploy da stack '${STACK_NAME}'..."
+  as_root "docker stack deploy -c '${COMPOSE_FILE}' '${STACK_NAME}'"
+  log "Stack enviada. Aguardando serviços subirem..."
+  sleep 3
+  as_root "docker stack services '${STACK_NAME}' || true"
+}
+
+show_summary() {
+  local ip; ip="$(first_ipv4)"
+  echo
+  echo "=============================================="
+  echo "✅ Instalação concluída."
+  echo "▶ Swarm: $(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo '-')"
+  echo "▶ Stack: ${STACK_NAME}"
+  echo "▶ Compose: ${COMPOSE_FILE}"
+  echo "▶ Portainer CE: ${PORTAINER_VERSION}"
+  echo "▶ Agent: ${AGENT_VERSION}"
+  echo "▶ UI: https://${ip}:9443"
+  [[ "${EXPOSE_TUNNEL}" == "true" ]] && echo "▶ Tunnel (Edge): ${ip}:8000"
+  echo "Para ver tarefas: sudo docker stack ps ${STACK_NAME}"
+  echo "=============================================="
+  echo
+  warn "Se acessar a UI pela primeira vez, aceite o certificado autoassinado e crie o usuário administrador."
+}
+
+############################################
+#          4) FIREWALL (OPCIONAL)         #
+############################################
+maybe_firewall_hint() {
+  # Apenas dica: não vamos mexer em nftables/ufw automaticamente.
+  cat <<'EOF'
+
+[Nota sobre portas/firewall]
+Se você usa firewall, garanta as portas abertas:
+- Portainer UI: 9443/tcp (e 8000/tcp se EXPOSE_TUNNEL=true)
+- Swarm cluster:
+  * 2377/tcp (controle)
+  * 7946/tcp e 7946/udp (membros)
+  * 4789/udp (rede overlay)
+
 EOF
-echo -e "${GREEN}✅ stack.yml criado em /root/stack.yml${NC}"
 }
 
-# ── Faz o deploy
-deploy_stack(){
-  echo -e "${BLUE}🚀 Fazendo deploy da stack...${NC}"
-  docker stack deploy -c /root/stack.yml core
-  echo -e "${GREEN}✅ Stack 'core' ativa. Verifique com: docker stack services core${NC}"
+############################################
+#                EXECUÇÃO                 #
+############################################
+main() {
+  require_root_or_sudo
+  need_cmd awk
+  need_cmd curl
+  need_cmd grep
+  need_cmd sed
+
+  install_docker
+  init_swarm
+  write_compose
+  deploy_stack
+  maybe_firewall_hint
+  show_summary
 }
 
-# ── FLOW
-check_system
-read_inputs
-install_docker
-init_swarm
-prepare_storage
-generate_stack
-deploy_stack
-
-echo -e "${GREEN}
-────────────────────────────────────────────────────────────────
-Portainer ➜ https://${PT_DOMAIN}
-Traefik   ➜ https://${TR_DOMAIN}
-────────────────────────────────────────────────────────────────${NC}"
+main "$@"
