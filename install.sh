@@ -1,293 +1,240 @@
-#!/usr/bin/env bash
-# Debian 12 (Bookworm)
-# Swarm + Traefik (LE + BasicAuth) + Portainer CE/Agent (versões fixas)
-# Perguntas: email (LE), domínios (Traefik/Portainer/Edge) e senha do Traefik
-# Execução: sudo ./install.sh
+#!/bin/bash
 
-set -Eeo pipefail   # sem -u para não quebrar com parâmetros faltantes
-trap 'echo -e "\n[ERR] Falhou na linha $LINENO"; exit 1' ERR
+# Cores
+GREEN='\e[32m'
+YELLOW='\e[33m'
+RED='\e[31m'
+BLUE='\e[34m'
+NC='\e[0m'
 
-# ===================== Aparência =====================
-GREEN='\e[32m'; YELLOW='\e[33m'; RED='\e[31m'; BLUE='\e[34m'; NC='\e[0m'
-
+# Função para mostrar spinner de carregamento
 spinner() {
-  local pid="$1" delay=0.1 sp='|/-\'
-  while kill -0 "$pid" 2>/dev/null; do
-    for i in 0 1 2 3; do
-      printf " [%c] " "${sp:$i:1}"
-      sleep "$delay"
-      printf "\b\b\b\b\b"
+    local pid=$1
+    local delay=0.1
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
     done
-  done
-  printf "     \b\b\b\b\b"
+    printf "    \b\b\b\b"
 }
 
-logo() {
-  clear
-  echo -e "${GREEN}
-  _____        _____ _  __  _________     _______  ______ ____   ____ _______ 
- |  __ \ /\   / ____| |/ / |__   __\ \   / /  __ \|  ____|  _ \ / __ \__   __|
- | |__) /  \ | |    | ' /     | |   \ \_/ /| |__) | |__  | |_) | |  | | | |   
- |  ___/ /\ \| |    |  <      | |    \   / |  ___/|  __| |  _ <| |  | | | |   
- | |  / ____ \ |____| . \     | |     | |  | |    | |____| |_) | |__| | | |   
- |_| /_/    \_\_____|_|\_\    |_|     |_|  |_|    |______|____/ \____/  |_|   
-${NC}"
+# Função para verificar requisitos do sistema
+check_system_requirements() {
+    echo -e "${BLUE}Verificando requisitos do sistema...${NC}"
+    
+    # Verificar espaço em disco (em GB, removendo a unidade 'G')
+    local free_space=$(df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
+    if [ "$free_space" -lt 10 ]; then
+        echo -e "${RED}❌ Erro: Espaço em disco insuficiente. Mínimo requerido: 10GB${NC}"
+        return 1
+    fi
+    
+    # Verificar memória RAM
+    local total_mem=$(free -g | awk 'NR==2 {print $2}')
+    if [ $total_mem -lt 2 ]; then
+        echo -e "${RED}❌ Erro: Memória RAM insuficiente. Mínimo requerido: 2GB${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}✅ Requisitos do sistema atendidos${NC}"
+    return 0
 }
 
-step() {
-  # seguro mesmo sem parâmetro
-  local c="${1:-1}" total=5
-  local p=$((c*100/total))
-  local f=$((p/2))
-  echo -ne "${GREEN}Passo ${YELLOW}${c}/${total} ${GREEN}["
-  for ((i=0;i<50;i++)); do
-    if (( i < f )); then echo -n "="; else echo -n " "; fi
-  done
-  echo -e "] ${p}%${NC}"
+# Logo animado
+show_animated_logo() {
+    clear
+    echo -e "${GREEN}"
+    echo -e "  _____        _____ _  __  _________     _______  ______ ____   ____ _______ "
+    echo -e " |  __ \ /\   / ____| |/ / |__   __\ \   / /  __ \|  ____|  _ \ / __ \__   __|"
+    echo -e " | |__) /  \ | |    | ' /     | |   \ \_/ /| |__) | |__  | |_) | |  | | | |   "
+    echo -e " |  ___/ /\ \| |    |  <      | |    \   / |  ___/|  __| |  _ <| |  | | | |   "
+    echo -e " | |  / ____ \ |____| . \     | |     | |  | |    | |____| |_) | |__| | | |   "
+    echo -e " |_| /_/    \_\_____|_|\_\    |_|     |_|  |_|    |______|____/ \____/  |_|   "
+    echo -e "${NC}"
+    sleep 1
 }
 
-# ===================== Versões =====================
-TRAEFIK_VERSION="${TRAEFIK_VERSION:-v3.5.0}"
-PORTAINER_VERSION="${PORTAINER_VERSION:-2.32.0}"
-AGENT_VERSION="${AGENT_VERSION:-2.32.0}"
-
-# ===================== Helpers =====================
-has() { command -v "$1" >/dev/null 2>&1; }
-as_root() { if [[ $EUID -ne 0 ]]; then sudo bash -c "$*"; else bash -c "$*"; fi; }
-ipv4() {
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i !~ /^127\./ && $i ~ /^[0-9.]+$/) {print $i; exit}}')
-  [[ -n "$ip" ]] && { echo "$ip"; return; }
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-  echo "${ip:-127.0.0.1}"
-}
-dhcp_in_use() {
-  pgrep -x dhclient >/dev/null 2>&1 && return 0
-  grep -RqsE 'iface\s+.+\s+inet\s+dhcp' /etc/network/interfaces* 2>/dev/null && return 0
-  grep -Rqs 'DHCP=yes' /etc/systemd/network 2>/dev/null && return 0
-  return 1
+# Função para mostrar um banner colorido
+function show_banner() {
+    echo -e "${GREEN}=============================================================================="
+    echo -e "=                                                                            ="
+    echo -e "=                 ${YELLOW}Preencha as informações solicitadas abaixo${GREEN}                 ="
+    echo -e "=                                                                            ="
+    echo -e "==============================================================================${NC}"
 }
 
-# ===================== 0) Inputs =====================
-logo
-echo -e "${GREEN}=============================================================================="
-echo -e "=                 ${YELLOW}Preencha as informações solicitadas abaixo${GREEN}                 ="
-echo -e "==============================================================================${NC}\n"
+# Função para mostrar uma mensagem de etapa com barra de progresso
+function show_step() {
+    local current=$1
+    local total=5
+    local percent=$((current * 100 / total))
+    local completed=$((percent / 2))
+    
+    echo -ne "${GREEN}Passo ${YELLOW}$current/$total ${GREEN}["
+    for ((i=0; i<50; i++)); do
+        if [ $i -lt $completed ]; then
+            echo -ne "="
+        else
+            echo -ne " "
+        fi
+    done
+    echo -e "] ${percent}%${NC}"
+}
 
-step 1; read -rp "📧 E-mail para Let's Encrypt: " EMAIL
-step 2; read -rp "🌐 Domínio do Traefik (ex: traefik.seudominio.com): " TRAEFIK_DOMAIN
-step 3; read -rsp "🔑 Senha do Traefik (dashboard BasicAuth): " TRAEFIK_PASS; echo
-step 4; read -rp "🌐 Domínio do Portainer (ex: portainer.seudominio.com): " PORTAINER_DOMAIN
-step 5; read -rp "🌐 Domínio do Edge (ex: edge.seudominio.com): " EDGE_DOMAIN
-echo
-
+# Mostrar banner inicial
 clear
-echo -e "${BLUE}📋 Resumo das Informações${NC}
-${GREEN}================================${NC}
-📧 E-mail LE: ${YELLOW}${EMAIL}${NC}
-🌐 Traefik:  ${YELLOW}${TRAEFIK_DOMAIN}${NC}
-🔑 Traefik:  ${YELLOW}********${NC}
-🌐 Portainer: ${YELLOW}${PORTAINER_DOMAIN}${NC}
-🌐 Edge:      ${YELLOW}${EDGE_DOMAIN}${NC}
-${GREEN}================================${NC}\n"
-read -rp "As informações estão corretas? (y/n): " OK
-[[ "${OK,,}" != "y" ]] && { echo -e "${RED}❌ Instalação cancelada.${NC}"; exit 0; }
+show_animated_logo
+show_banner
+echo ""
 
-# ===================== 1) Pré-checagens =====================
-echo -e "${BLUE}Verificando requisitos do sistema...${NC}"
-FREE_GB=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
-[[ ${FREE_GB:-0} -lt 5 ]] && { echo -e "${RED}❌ Espaço insuficiente (<5GB).${NC}"; exit 1; }
-TOTAL_RAM_GB=$(free -g | awk 'NR==2{print $2}')
-[[ ${TOTAL_RAM_GB:-0} -lt 1 ]] && { echo -e "${RED}❌ RAM insuficiente (<1GB).${NC}"; exit 1; }
-echo -e "${GREEN}✅ Requisitos OK${NC}"
+# Solicitar informações do usuário
+show_step 1
+read -p "📧 Endereço de e-mail: " email
+echo ""
+show_step 2
+read -p "🌐 Dominio do Traefik (ex: traefik.seudominio.com): " traefik
+echo ""
+show_step 3
+read -s -p "🔑 Senha do Traefik: " senha
+echo ""
+echo ""
+show_step 4
+read -p "🌐 Dominio do Portainer (ex: portainer.seudominio.com): " portainer
+echo ""
+show_step 5
+read -p "🌐 Dominio do Edge (ex: edge.seudominio.com): " edge
+echo ""
 
-# ===================== 2) Limpeza leve (opcional) =====================
-read -rp "Deseja limpar pacotes não essenciais antes? (recomendado) [Y/n]: " DO_CLEAN
-DO_CLEAN=${DO_CLEAN:-Y}
-if [[ "${DO_CLEAN,,}" == "y" ]]; then
-  echo -e "${YELLOW}🧹 Limpando pacotes não essenciais...${NC}"
-  PKGS="apt-listchanges console-setup console-setup-linux debconf-i18n dictionaries-common iamerican ibritish keyboard-configuration \
-libx11-6 libx11-data libxext6 libxmuu1 mailcap manpages mime-support nano \
-python3-apt python3-certifi python3-chardet python3-charset-normalizer python3-debconf python3-debian python3-debianbts \
-python3-httplib2 python3-idna python3-pkg-resources python3-pycurl python3-pyparsing python3-pysimplesoap python3-reportbug \
-python3-requests python3-six python3-urllib3 reportbug task-english tasksel tasksel-data vim-common vim-tiny xauth"
-  if ! dhcp_in_use; then PKGS="$PKGS isc-dhcp-client isc-dhcp-common"; echo "[INFO] DHCP não detectado -> isc-dhcp-* será removido."; else echo "[INFO] DHCP detectado -> preservando isc-dhcp-*."; fi
-  (as_root "apt-get update -y && apt-get remove --purge -y $PKGS || true && apt-get autoremove --purge -y && apt-get clean && apt-get autoclean") >/dev/null 2>&1 &
-  spinner $!
-  as_root "rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/* /usr/share/man/* /usr/share/info/*" || true
-  echo -e "${GREEN}✅ Limpeza concluída${NC}"
-fi
+# Verificação de dados
+clear
+echo -e "${BLUE}📋 Resumo das Informações${NC}"
+echo -e "${GREEN}================================${NC}"
+echo -e "📧 Seu E-mail: ${YELLOW}$email${NC}"
+echo -e "🌐 Dominio do Traefik: ${YELLOW}$traefik${NC}"
+echo -e "🔑 Senha do Traefik: ${YELLOW}********${NC}"
+echo -e "🌐 Dominio do Portainer: ${YELLOW}$portainer${NC}"
+echo -e "🌐 Dominio do Edge: ${YELLOW}$edge${NC}"
+echo -e "${GREEN}================================${NC}"
+echo ""
 
-# ===================== 3) Docker Engine =====================
-if ! has docker; then
-  echo -e "${YELLOW}🐳 Instalando Docker Engine (repo oficial)...${NC}"
-  (as_root "apt-get update -y && apt-get install -y ca-certificates curl gnupg lsb-release && \
-   install -m 0755 -d /etc/apt/keyrings && \
-   curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor | tee /tmp/docker.gpg >/dev/null && \
-   mv /tmp/docker.gpg /etc/apt/keyrings/docker.gpg && chmod a+r /etc/apt/keyrings/docker.gpg && \
-   echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable\" > /etc/apt/sources.list.d/docker.list && \
-   apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && \
-   systemctl enable --now docker") >/dev/null 2>&1 &
-  spinner $!
-else
-  echo -e "${GREEN}✅ Docker já instalado${NC}"
-fi
+read -p "As informações estão certas? (y/n): " confirma1
+if [ "$confirma1" == "y" ]; then
+    clear
+    
+    # Verificar requisitos do sistema
+    check_system_requirements || exit 1
+    
+    echo -e "${BLUE}🚀 Iniciando instalação...${NC}"
+    
+    #########################################################
+    # INSTALANDO DEPENDENCIAS
+    #########################################################
+    echo -e "${YELLOW}📦 Atualizando sistema e instalando dependências...${NC}"
+    (sudo apt update -y && sudo apt upgrade -y) > /dev/null 2>&1 &
+    spinner $!
+    
+    echo -e "${YELLOW}🐳 Instalando Docker...${NC}"
+    (sudo apt install -y curl && \
+    curl -fsSL https://get.docker.com -o get-docker.sh && \
+    sudo sh get-docker.sh) > /dev/null 2>&1 &
+    spinner $!
+    
+    mkdir -p ~/Portainer && cd ~/Portainer
+    echo -e "${GREEN}✅ Dependências instaladas com sucesso${NC}"
+    sleep 2
+    clear
 
-# ===================== 4) Swarm init =====================
-IP=$(ipv4)
-SWARM_STATE=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "inactive")
-if [[ "$SWARM_STATE" != "active" ]]; then
-  echo -e "${YELLOW}🕸️  Inicializando Docker Swarm (advertise-addr ${IP})...${NC}"
-  as_root "docker swarm init --advertise-addr '${IP}'"
-else
-  echo -e "${GREEN}✅ Swarm já ativo${NC}"
-fi
-
-# ===================== 5) Preparos =====================
-# Hash BasicAuth (apr1) para Traefik
-if ! has openssl; then as_root "apt-get update -y && apt-get install -y openssl" >/dev/null 2>&1; fi
-TRAEFIK_USER="admin"
-TRAEFIK_HASH=$(openssl passwd -apr1 "${TRAEFIK_PASS}")
-
-STACK_NAME="infra"
-STACK_DIR="/opt/${STACK_NAME}"
-as_root "mkdir -p '${STACK_DIR}'"
-
-# ===================== 6) Stack (Traefik + Portainer) =====================
-cat > "/tmp/${STACK_NAME}.yml" <<YAML
-version: "3.8"
-
-networks:
-  proxy:
-    driver: overlay
-    attachable: true
-
-volumes:
-  traefik_letsencrypt:
-    driver: local
-  portainer_data:
-    driver: local
-
+    #########################################################
+    # CRIANDO DOCKER-COMPOSE.YML
+    #########################################################
+    cat > docker-compose.yml <<EOL
 services:
   traefik:
-    image: traefik:${TRAEFIK_VERSION}
+    container_name: traefik
+    image: "traefik:latest"
+    restart: always
     command:
-      - --global.checknewversion=false
-      - --log.level=ERROR
-      - --accesslog=false
-      - --api.dashboard=true
-      - --serversTransport.insecureSkipVerify=true
-      - --providers.docker=true
-      - --providers.docker.swarmMode=true
-      - --providers.docker.endpoint=unix:///var/run/docker.sock
-      - --providers.docker.exposedByDefault=false
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      - --entrypoints.web.http.redirections.entryPoint.to=websecure
-      - --certificatesresolvers.leresolver.acme.email=${EMAIL}
-      - --certificatesresolvers.leresolver.acme.storage=/letsencrypt/acme.json
+      - --api.insecure=true
+      - --api.dashboard=true
+      - --providers.docker
+      - --log.level=ERROR
       - --certificatesresolvers.leresolver.acme.httpchallenge=true
+      - --certificatesresolvers.leresolver.acme.email=$email
+      - --certificatesresolvers.leresolver.acme.storage=./acme.json
       - --certificatesresolvers.leresolver.acme.httpchallenge.entrypoint=web
     ports:
-      - target: 80
-        published: 80
-        mode: ingress
-      - target: 443
-        published: 443
-        mode: ingress
+      - "80:80"
+      - "443:443"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - traefik_letsencrypt:/letsencrypt
-    networks:
-      - proxy
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.traefik.rule=Host(\`${TRAEFIK_DOMAIN}\`)"
-        - "traefik.http.routers.traefik.entrypoints=websecure"
-        - "traefik.http.routers.traefik.tls.certresolver=leresolver"
-        - "traefik.http.routers.traefik.service=api@internal"
-        - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_USER}:${TRAEFIK_HASH}"
-        - "traefik.http.routers.traefik.middlewares=traefik-auth"
-
-  agent:
-    image: portainer/agent:${AGENT_VERSION}
-    environment:
-      AGENT_CLUSTER_ADDR: tasks.agent
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/volumes:/var/lib/docker/volumes
-    networks:
-      - proxy
-    deploy:
-      mode: global
-      placement:
-        constraints:
-          - node.platform.os == linux
-
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./acme.json:/acme.json"
+    labels:
+      - "traefik.http.routers.http-catchall.rule=hostregexp(\`{host:.+}\`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(\`$traefik\`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.http.routers.traefik-dashboard.tls.certresolver=leresolver"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=$senha"
+      - "traefik.http.routers.traefik-dashboard.middlewares=traefik-auth"
   portainer:
-    image: portainer/portainer-ce:${PORTAINER_VERSION}
-    command: >
-      -H tcp://tasks.agent:9001
-      --tlsskipverify
+    image: portainer/portainer-ce-ce:latest
+    command: -H unix:///var/run/docker.sock
+    restart: always
     volumes:
-      - portainer_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - proxy
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      labels:
-        - "traefik.enable=true"
-        # UI do Portainer (backend 9443 HTTPS; skipVerify já global no serversTransport)
-        - "traefik.http.routers.portainer.rule=Host(\`${PORTAINER_DOMAIN}\`)"
-        - "traefik.http.routers.portainer.entrypoints=websecure"
-        - "traefik.http.routers.portainer.tls.certresolver=leresolver"
-        - "traefik.http.services.portainer.loadbalancer.server.scheme=https"
-        - "traefik.http.services.portainer.loadbalancer.server.port=9443"
-        # Edge (túnel) - porta 8000
-        - "traefik.http.routers.edge.rule=Host(\`${EDGE_DOMAIN}\`)"
-        - "traefik.http.routers.edge.entrypoints=websecure"
-        - "traefik.http.routers.edge.tls.certresolver=leresolver"
-        - "traefik.http.services.edge.loadbalancer.server.port=8000"
-YAML
+      - portainer_data:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(\`$portainer\`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.services.frontend.loadbalancer.server.port=9000"
+      - "traefik.http.routers.frontend.service=frontend"
+      - "traefik.http.routers.frontend.tls.certresolver=leresolver"
+      - "traefik.http.routers.edge.rule=Host(\`$edge\`)"
+      - "traefik.http.routers.edge.entrypoints=websecure"
+      - "traefik.http.services.edge.loadbalancer.server.port=8000"
+      - "traefik.http.routers.edge.service=edge"
+      - "traefik.http.routers.edge.tls.certresolver=leresolver"
+volumes:
+  portainer_data:
+EOL
 
-# Volume para LE (Traefik cria acme.json)
-as_root "docker volume create traefik_letsencrypt >/dev/null 2>&1 || true"
-
-# ===================== 7) Deploy =====================
-echo -e "${YELLOW}🚀 Fazendo deploy da stack 'infra' (Traefik + Portainer)...${NC}"
-(as_root "docker stack deploy -c /tmp/${STACK_NAME}.yml ${STACK_NAME}") >/dev/null 2>&1 & spinner $!
-
-# ===================== 8) Verificação =====================
-echo -e "${BLUE}Verificando serviços...${NC}"
-as_root "docker stack services ${STACK_NAME}"
-echo
-
-# ===================== 9) Dicas/Firewall =====================
-echo -e "${YELLOW}Se usar firewall, abra as portas:${NC}
-- 80/tcp e 443/tcp (Traefik)
-- Swarm entre nós: 2377/tcp, 7946/tcp+udp, 4789/udp
-"
-
-# ===================== 10) Sumário =====================
-echo -e "${GREEN}================================${NC}"
-echo -e "✅  Deploy concluído."
-echo -e "🔐 Traefik Dashboard: https://${TRAEFIK_DOMAIN}"
-echo -e "   Usuário: admin | Senha: (a que você digitou)"
-echo -e "🛠  Portainer UI:     https://${PORTAINER_DOMAIN}"
-echo -e "🔌 Portainer Edge:    https://${EDGE_DOMAIN}"
-echo -e "${GREEN}================================${NC}"
-echo -e "Comandos úteis:"
-echo -e "  docker stack ps ${STACK_NAME}"
-echo -e "  docker service logs ${STACK_NAME}_traefik -f"
-echo -e "  docker service logs ${STACK_NAME}_portainer -f"
+    #########################################################
+    # CERTIFICADOS LETSENCRYPT
+    #########################################################
+    echo -e "${YELLOW}📝 Gerando certificado LetsEncrypt...${NC}"
+    touch acme.json
+    sudo chmod 600 acme.json
+    
+    #########################################################
+    # INICIANDO CONTAINER
+    #########################################################
+    echo -e "${YELLOW}🚀 Iniciando containers...${NC}"
+    (sudo docker stack deploy -c docker-compose.yml infra) > /dev/null 2>&1 &
+    spinner $!
+    
+    clear
+    show_animated_logo
+    
+    echo -e "${GREEN}🎉 Instalação concluída com sucesso!${NC}"
+    echo -e "${BLUE}📝 Informações de Acesso:${NC}"
+    echo -e "${GREEN}================================${NC}"
+    echo -e "🔗 Portainer: ${YELLOW}https://$portainer${NC}"
+    echo -e "🔗 Traefik: ${YELLOW}https://$traefik${NC}"
+    echo -e "${GREEN}================================${NC}"
+    echo ""
+    echo -e "${BLUE}💡 Dica: Aguarde alguns minutos para que os certificados SSL sejam gerados${NC}"
+    echo -e "${GREEN}🌟 Visite: https://packtypebot.com.br${NC}"
+else
+    echo -e "${RED}❌ Instalação cancelada. Por favor, inicie novamente.${NC}"
+    exit 0
+fi
