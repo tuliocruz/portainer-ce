@@ -1,7 +1,9 @@
-
-<img src="https://i.postimg.cc/4dh7HRpq/autoinstall.png"> 
-
 ## ⚠️ Pré-requisitos
+## Comandos:
+sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install-docker-swarn.sh && sudo ./install-docker-swarn.sh
+
+sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install.sh && sudo ./install.sh
+
 
 Você deve criar 6 subdominios do tipo 'A' na Cloudflare
 *Status do Proxy deve esta desligado
@@ -13,13 +15,7 @@ Você deve criar 6 subdominios do tipo 'A' na Cloudflare
 <p>edge</p>
 <p>www.edge</p>
 
-<img src="https://packtypebot.com.br/wp-content/uploads/2023/12/apontamentos.png"> 
-
 <a href="https://packtypebot.com.br/gerador/htpasswd.php">Gerador de Senha htpasswd</a>
-
-## 🎥 Tutorial
-
-https://www.youtube.com/watch?v=GuT92GXosTw
 
 ## 💽 Instalação
 
@@ -30,7 +26,6 @@ sudo apt update && sudo apt install -y git && git clone https://github.com/tulio
 ```
 
 ## Caso  instância do Portainer expire
-<img class="alignnone wp-image-2222 size-full" src="https://packtypebot.com.br/wp-content/uploads/2023/12/erro-port.jpg" alt="" width="950" height="385" />
 
 Abra o terminal e rode os seguintes comandos:
 
