@@ -1,9 +1,4 @@
 ## ⚠️ Pré-requisitos
-## Comandos:
-sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install-docker-swarn.sh && sudo ./install-docker-swarn.sh
-
-sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install.sh && sudo ./install.sh
-
 
 Você deve criar 6 subdominios do tipo 'A' na Cloudflare
 *Status do Proxy deve esta desligado
@@ -22,7 +17,9 @@ Você deve criar 6 subdominios do tipo 'A' na Cloudflare
 <p>Copie e cole no Terminal da sua VPS:</p>
 
 ```
-sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-packtypebot && sudo chmod +x install.sh && ./install.sh
+sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install-docker-swarn.sh && sudo ./install-docker-swarn.sh
+
+sudo apt update && sudo apt install -y git && git clone https://github.com/tuliocruz/portainer-ce.git && cd portainer-ce && sudo chmod +x install.sh && sudo ./install.sh
 ```
 
 ## Caso  instância do Portainer expire
